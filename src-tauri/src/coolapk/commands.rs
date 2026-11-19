@@ -4047,24 +4047,35 @@ mod login_callback_tests {
     }
 
     #[test]
-    fn limits_same_cookie_verification_but_retries_new_sessions_and_callbacks() {
+    fn limits_same_session_verification_and_retries_new_sessions() {
         let mut verification = super::LoginVerification::default();
-        for _ in 0..4 { assert!(verification.should_verify_cookie("SESSID=one; uid=12", None)); }
-        assert!(!verification.should_verify_cookie("uid=12; SESSID=one", None));
+        assert!(verification.should_verify_cookie("SESSID=one; uid=12", None));
+        // 同一会话进入退避，不会连发请求。
+        assert!(!verification.should_verify_cookie("SESSID=one; uid=12", None));
+        verification.cookie_next_retry = None;
+        // Cookie 顺序变化仍属同一会话。
+        assert!(verification.should_verify_cookie("uid=12; SESSID=one", None));
+        verification.cookie_next_retry = None;
+        assert!(verification.should_verify_cookie("SESSID=one; uid=12", None));
+        // 同一会话最多三次。
+        assert!(!verification.should_verify_cookie("SESSID=one; uid=12", None));
+        // 新会话或新回调重新排期。
         assert!(verification.should_verify_cookie("SESSID=two; uid=12", None));
-        for _ in 0..3 { assert!(verification.should_verify_cookie("SESSID=two; uid=12", None)); }
-        assert!(!verification.should_verify_cookie("SESSID=two; uid=12", None));
+        verification.cookie_next_retry = None;
         assert!(verification.should_verify_cookie("SESSID=two; uid=12", Some("new-callback")));
     }
 
     #[test]
-    fn resumes_verification_after_cooldown_even_if_login_keeps_the_same_cookie() {
+    fn stops_after_three_attempts_until_session_changes() {
         let mut verification = super::LoginVerification::default();
-        for _ in 0..4 { assert!(verification.should_verify_cookie("SESSID=unchanged", None)); }
+        for _ in 0..3 {
+            verification.cookie_next_retry = None;
+            assert!(verification.should_verify_cookie("SESSID=unchanged", None));
+        }
+        verification.cookie_next_retry = None;
         assert!(!verification.should_verify_cookie("SESSID=unchanged", None));
-        // 短信登录完成后 Cookie 可能不变，冷却结束必须重新校验，不能永久停掉自动同步。
-        verification.cookie_next_retry = Some(std::time::Instant::now());
-        assert!(verification.should_verify_cookie("SESSID=unchanged", None));
+        // 登录完成后 Cookie 变化立即恢复校验。
+        assert!(verification.should_verify_cookie("SESSID=changed", None));
         assert_eq!(verification.cookie_attempts, 1);
     }
 
