@@ -27,6 +27,7 @@ pub struct LoginSession {
 struct LoginVerification {
     attempted_access_callback: Option<String>,
     completed: bool,
+    /// 已经发起过校验的会话指纹；只有新会话（新 Cookie 或新回调）才重新校验。
     cookie_fingerprint: Option<String>,
     cookie_attempts: u8,
     cookie_next_retry: Option<Instant>,
@@ -58,8 +59,8 @@ impl LoginVerification {
         }
     }
 
-    /// 没有 Cookie 的等待不计次数；同一会话失败四次后暂停十秒，登录后仍可继续同步。
-    /// 桌面端与移动端共用同一限频，避免在登录页反复请求账号校验接口。
+    /// 只有新会话才校验：同一会话最多尝试三次（2s/8s 退避），避免在登录页反复打账号接口，
+    /// 也避免把酷安风控触发成 403。登录窗口里的会话一变就会重新排期。
     fn should_verify_cookie(&mut self, cookie: &str, callback: Option<&str>) -> bool {
         let fingerprint = session_cookie_fingerprint(cookie, callback);
         if self.cookie_fingerprint.as_deref() != Some(fingerprint.as_str()) {
@@ -67,13 +68,19 @@ impl LoginVerification {
             self.cookie_attempts = 0;
             self.cookie_next_retry = None;
         }
-        if self.cookie_attempts >= 4 {
-            if self.cookie_next_retry.is_some_and(|at| Instant::now() < at) { return false; }
-            self.cookie_attempts = 0;
-            self.cookie_next_retry = None;
+        if self.cookie_attempts >= 3 {
+            return false;
+        }
+        if self.cookie_next_retry.is_some_and(|at| Instant::now() < at) {
+            return false;
         }
         self.cookie_attempts += 1;
-        if self.cookie_attempts == 4 { self.cookie_next_retry = Some(Instant::now() + Duration::from_secs(10)); }
+        let backoff = match self.cookie_attempts {
+            1 => Duration::from_secs(2),
+            2 => Duration::from_secs(8),
+            _ => Duration::from_secs(30),
+        };
+        self.cookie_next_retry = Some(Instant::now() + backoff);
         true
     }
 }
