@@ -27,12 +27,18 @@ pub struct LoginSession {
 struct LoginVerification {
     attempted_access_callback: Option<String>,
     completed: bool,
-    #[cfg(any(target_os = "ios", test))]
-    ios_cookie_fingerprint: Option<String>,
-    #[cfg(any(target_os = "ios", test))]
-    ios_cookie_attempts: u8,
-    #[cfg(any(target_os = "ios", test))]
-    ios_cookie_next_retry: Option<Instant>,
+    cookie_fingerprint: Option<String>,
+    cookie_attempts: u8,
+    cookie_next_retry: Option<Instant>,
+    /// 打开登录窗口时的会话指纹；相同说明用户还没真正重新登录。
+    baseline_cookie_fingerprint: Option<String>,
+}
+
+/// 会话指纹：与 Cookie 顺序无关，用于判断登录窗口里的会话有没有变过。
+fn session_cookie_fingerprint(cookie: &str, callback: Option<&str>) -> String {
+    let mut pairs = cookie.split(';').map(str::trim).collect::<Vec<_>>();
+    pairs.sort_unstable();
+    format!("{:x}", Md5::digest(format!("{}\n{}", pairs.join(";"), callback.unwrap_or_default()).as_bytes()))
 }
 
 impl LoginVerification {
@@ -40,33 +46,47 @@ impl LoginVerification {
         has_session && self.attempted_access_callback.as_deref() != Some(callback)
     }
 
+    /// 记录打开登录窗口时的会话；返回 false 表示当前仍是那个旧会话，不能自动登录。
+    fn remember_baseline(&mut self, cookie: &str) -> bool {
+        let fingerprint = session_cookie_fingerprint(cookie, None);
+        match self.baseline_cookie_fingerprint.as_deref() {
+            None => {
+                self.baseline_cookie_fingerprint = Some(fingerprint);
+                false
+            }
+            Some(baseline) => baseline != fingerprint,
+        }
+    }
+
     /// 没有 Cookie 的等待不计次数；同一会话失败四次后暂停十秒，登录后仍可继续同步。
-    #[cfg(any(target_os = "ios", test))]
-    fn should_verify_ios_cookie(&mut self, cookie: &str, callback: Option<&str>) -> bool {
-        let mut pairs = cookie.split(';').map(str::trim).collect::<Vec<_>>();
-        pairs.sort_unstable();
-        let fingerprint = format!("{:x}", Md5::digest(format!("{}\n{}", pairs.join(";"), callback.unwrap_or_default()).as_bytes()));
-        if self.ios_cookie_fingerprint.as_deref() != Some(fingerprint.as_str()) {
-            self.ios_cookie_fingerprint = Some(fingerprint);
-            self.ios_cookie_attempts = 0;
-            self.ios_cookie_next_retry = None;
+    /// 桌面端与移动端共用同一限频，避免在登录页反复请求账号校验接口。
+    fn should_verify_cookie(&mut self, cookie: &str, callback: Option<&str>) -> bool {
+        let fingerprint = session_cookie_fingerprint(cookie, callback);
+        if self.cookie_fingerprint.as_deref() != Some(fingerprint.as_str()) {
+            self.cookie_fingerprint = Some(fingerprint);
+            self.cookie_attempts = 0;
+            self.cookie_next_retry = None;
         }
-        if self.ios_cookie_attempts >= 4 {
-            if self.ios_cookie_next_retry.is_some_and(|at| Instant::now() < at) { return false; }
-            self.ios_cookie_attempts = 0;
+        if self.cookie_attempts >= 4 {
+            if self.cookie_next_retry.is_some_and(|at| Instant::now() < at) { return false; }
+            self.cookie_attempts = 0;
+            self.cookie_next_retry = None;
         }
-        self.ios_cookie_attempts += 1;
-        if self.ios_cookie_attempts == 4 { self.ios_cookie_next_retry = Some(Instant::now() + Duration::from_secs(10)); }
+        self.cookie_attempts += 1;
+        if self.cookie_attempts == 4 { self.cookie_next_retry = Some(Instant::now() + Duration::from_secs(10)); }
         true
     }
 }
 
-/// iOS 官方页面可能在原 URL 内完成短信登录，不依赖网页是否发生跳转。
-#[cfg(any(target_os = "ios", test))]
-fn should_poll_ios_login_cookies(url: &reqwest::Url) -> bool {
+/// 官方页面可能在原 URL 内完成短信登录，不依赖网页是否发生跳转。
+/// 桌面端同样适用：授权回调可能被 302 跳过，只靠 URL 变化会漏掉登录完成。
+fn should_poll_login_cookies(url: &reqwest::Url) -> bool {
     if url.scheme() != "https" { return false; }
     match url.host_str() {
-        Some("account.coolapk.com") => matches!(url.path().trim_end_matches('/'), "/auth/login" | "/auth/callback"),
+        Some("account.coolapk.com") => matches!(
+            url.path().trim_end_matches('/'),
+            "/auth/login" | "/auth/loginByCoolapk" | "/auth/callback"
+        ),
         Some("www.coolapk.com" | "m.coolapk.com" | "coolapk.com") => true,
         _ => false,
     }
@@ -93,6 +113,9 @@ fn merge_ios_login_cookies(mut cookies: Vec<(String, String, String)>) -> String
 
 static IMAGE_SAVE_LOCK: Mutex<()> = Mutex::new(());
 static IMAGE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// 自动同步凭据的总尝试预算：单次登录最多尝试这么多次，之后转由用户手动同步。
+const AUTO_LOGIN_VERIFY_LIMIT: u32 = 60;
 
 /// 登录窗口使用桌面 Chromium UA，避免网易易盾把鼠标事件误判为仅支持触摸事件。
 const LOGIN_WEBVIEW_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36";
@@ -3444,12 +3467,16 @@ fn login_callback_kind(url: &reqwest::Url, app_origin: &str) -> Option<&'static 
     {
         return Some("official");
     }
-    if url.as_str().starts_with(&format!("{app_origin}/"))
-        && url
+    if url.as_str().starts_with(&format!("{app_origin}/")) {
+        // 官方 redirect 可能把回调参数挂在 hash 路由（#/auth_callback?）或直接挂成路径（/auth_callback?），两种都认。
+        let route = url
             .fragment()
-            .is_some_and(|fragment| fragment.split('?').next() == Some("/auth_callback"))
-    {
-        return Some("app-origin");
+            .filter(|fragment| !fragment.is_empty())
+            .map(|fragment| fragment.split('?').next().unwrap_or_default())
+            .unwrap_or_else(|| url.path());
+        if route.trim_end_matches('/') == "/auth_callback" {
+            return Some("app-origin");
+        }
     }
     None
 }
@@ -3478,6 +3505,28 @@ fn extract_callback_param(url: &str, key: &str) -> Option<String> {
 /// 从回跳 URL 中提取完整 Cookie 字符串。
 fn extract_ck_from_url(url: &str) -> Option<String> {
     extract_callback_param(url, "ck")
+}
+
+/// 记录授权回调地址；返回 true 表示应拦截这次导航（由客户端消费，不再加载页面）。
+/// 即使回调没有授权码也要记录：登录窗口一旦加载应用界面，URL 可能在下次轮询前就变了。
+fn capture_login_callback(session: &LoginSession, url: &reqwest::Url, app_origin: &str) -> bool {
+    if login_callback_kind(url, app_origin).is_none() {
+        return false;
+    }
+    let has_code = extract_access_code_from_url(url.as_str()).is_some();
+    let mut stored = false;
+    if let Ok(mut captured) = session.callback_url.lock() {
+        if has_code || captured.is_none() {
+            stored = true;
+            *captured = Some(url.to_string());
+        }
+    }
+    // 轮询会反复命中同一个 URL，只在真正记录或拦截时写日志，避免刷屏。
+    if stored || has_code {
+        log::info!("login.callback_captured source={}", if stored { "record" } else { "block" });
+    }
+    // 只有授权码回调必须拦截；只带 ck 的回调放行，让窗口显示“正在验证”页面。
+    has_code
 }
 
 /// 合并回调参数和 WebView2 Cookie 存储中的 Cookie，后者覆盖同名旧值。
@@ -3685,8 +3734,6 @@ async fn verify_login_webview(
     session: &LoginSession,
     automatic: bool,
 ) -> Result<bool, String> {
-    #[cfg(not(target_os = "ios"))]
-    let _ = automatic;
     let mut verification = session.verification.lock().await;
     if verification.completed {
         return Ok(true);
@@ -3710,13 +3757,18 @@ async fn verify_login_webview(
         }
     };
     let cookie = merge_cookie_headers(callback_cookie.as_deref(), webview_cookie.as_deref());
+    // 登录窗口与主窗口共用 Cookie 存储，打开瞬间可能还留着旧账号会话。
+    // 与基线相同的会话一律不自动登录，避免 logout 未生效时静默登回旧账号。
+    if automatic && !verification.remember_baseline(cookie.as_deref().unwrap_or_default()) {
+        log::info!("login.baseline_session_skipped");
+        return Ok(false);
+    }
     let has_session = cookie.as_deref().is_some_and(CoolapkClient::has_valid_session_cookie);
     if !has_session {
         log::info!("login.cookie_not_ready");
         return Ok(false);
     }
-    #[cfg(target_os = "ios")]
-    if automatic && !verification.should_verify_ios_cookie(cookie.as_deref().unwrap_or_default(), callback.as_deref()) {
+    if automatic && !verification.should_verify_cookie(cookie.as_deref().unwrap_or_default(), callback.as_deref()) {
         return Ok(false);
     }
     let state = app.state::<AppState>();
@@ -3878,7 +3930,7 @@ pub async fn open_login_webview(app: tauri::AppHandle) -> Result<(), String> {
                 if let Some(win) = app.get_webview_window("login_window") {
                     log::info!("login.ios_return_requested");
                     // 退出登录页不恢复旧会话；其他页面返回前先同步，用户无需杀掉应用。
-                    let can_sync = win.url().ok().is_some_and(|url| should_poll_ios_login_cookies(&url));
+                    let can_sync = win.url().ok().is_some_and(|url| should_poll_login_cookies(&url));
                     if can_sync { let _ = verify_login_webview(&app, &win, &session, false).await; }
                     // 同步期间可能重新打开登录窗口，旧返回任务不能关闭新会话。
                     let current = app.state::<AppState>().login_session.lock().ok().and_then(|value| value.clone());
@@ -3889,15 +3941,9 @@ pub async fn open_login_webview(app: tauri::AppHandle) -> Result<(), String> {
             });
             return false;
         }
-        if login_callback_kind(url, &navigation_app_origin).is_some()
-            && extract_access_code_from_url(url.as_str()).is_some()
-        {
-            if let Ok(mut captured) = navigation_session.callback_url.lock() {
-                *captured = Some(url.to_string());
-            }
-            log::info!("login.callback_navigation_captured");
-            // 与官方 APK LoginFragment.shouldOverrideUrlLoading 一致：
-            // 授权回调由客户端消费，不再放行到官网宣传落地页。
+        // 与官方 APK LoginFragment.shouldOverrideUrlLoading 一致：
+        // 授权回调由客户端消费，不再放行到官网宣传落地页。
+        if capture_login_callback(&navigation_session, url, &navigation_app_origin) {
             return false;
         }
         true
@@ -3944,40 +3990,31 @@ pub async fn open_login_webview(app: tauri::AppHandle) -> Result<(), String> {
                 log::info!("login.navigation_changed");
                 last_url = Some(url.to_string());
             }
-            // 同时兼容包含 ck 但没有授权码的回调。
-            if login_callback_kind(&url, &get_app_origin(&app_handle)).is_some() {
-                if let Ok(mut captured) = session.callback_url.lock() {
-                    if captured.is_none() {
-                        *captured = Some(url.to_string());
-                    }
-                }
-            }
+            // URL 轮询兜底：302 跳过回调页时 on_navigation 可能看不到，这里照样记录。
+            let _ = capture_login_callback(&session, &url, &get_app_origin(&app_handle));
             let callback = session.callback_url.lock().ok().and_then(|value| value.clone());
             if callback != last_callback {
+                // 新的回调地址说明用户重新发起了一次登录，重新给足自动同步次数。
                 attempts = 0;
                 last_attempt = None;
                 last_callback = callback.clone();
             }
-            let on_landing = url.scheme() == "https"
-                && matches!(url.host_str(), Some("www.coolapk.com" | "m.coolapk.com" | "coolapk.com"));
-            #[cfg(target_os = "ios")]
-            let ios_cookie_poll = callback.is_some() || should_poll_ios_login_cookies(&url);
-            #[cfg(not(target_os = "ios"))]
-            let ios_cookie_poll = false;
-            // iOS 等待会话写入期间持续轮询，账号校验由会话指纹和失败后的冷却时间限频。
-            if (callback.is_some() || on_landing || ios_cookie_poll) && (attempts < 4 || ios_cookie_poll)
-                && last_attempt.is_none_or(|at| at.elapsed() >= Duration::from_secs(2))
-            {
+            // 等待会话写入期间持续轮询，账号校验由会话指纹和失败后的冷却时间限频。
+            // 桌面端同样需要：授权回调可能被 302 跳过，或登录成功后直接停在官方页面。
+            let cookie_poll = callback.is_some() || should_poll_login_cookies(&url);
+            if cookie_poll && last_attempt.is_none_or(|at| at.elapsed() >= Duration::from_secs(2)) {
+                if attempts >= AUTO_LOGIN_VERIFY_LIMIT {
+                    // 达到预算后保留窗口，用户仍可点“同步凭据”或重新发起登录。
+                    log::warn!("login.callback_retry_exhausted");
+                    break;
+                }
                 attempts += 1;
                 last_attempt = Some(Instant::now());
-                log::info!("login.callback_attempt number={attempts}");
-                match verify_login_webview(&app_handle, &win, &session, true).await {
-                    Ok(true) => break,
-                    _ => log::warn!("login.callback_unverified"),
+                log::info!("login.callback_attempt");
+                if verify_login_webview(&app_handle, &win, &session, true).await.unwrap_or(false) {
+                    break;
                 }
-                if attempts == 4 && !ios_cookie_poll {
-                    log::warn!("login.callback_retry_exhausted");
-                }
+                log::warn!("login.callback_unverified");
             }
         }
     });
@@ -3993,35 +4030,35 @@ mod login_callback_tests {
     };
 
     #[test]
-    fn ios_waits_for_sms_login_on_account_page_but_not_logout_or_untrusted_pages() {
-        for url in ["https://account.coolapk.com/auth/login", "https://account.coolapk.com/auth/login/?type=coolapk", "https://account.coolapk.com/auth/callback", "https://www.coolapk.com/"] {
-            assert!(super::should_poll_ios_login_cookies(&reqwest::Url::parse(url).unwrap()));
+    fn polls_cookie_on_account_page_but_not_logout_or_untrusted_pages() {
+        for url in ["https://account.coolapk.com/auth/login", "https://account.coolapk.com/auth/login/?type=coolapk", "https://account.coolapk.com/auth/loginByCoolapk", "https://account.coolapk.com/auth/callback", "https://www.coolapk.com/"] {
+            assert!(super::should_poll_login_cookies(&reqwest::Url::parse(url).unwrap()));
         }
         for url in ["https://account.coolapk.com/auth/logout", "https://account.coolapk.com/other", "http://account.coolapk.com/auth/login", "https://account.coolapk.com.evil.test/auth/login"] {
-            assert!(!super::should_poll_ios_login_cookies(&reqwest::Url::parse(url).unwrap()));
+            assert!(!super::should_poll_login_cookies(&reqwest::Url::parse(url).unwrap()));
         }
     }
 
     #[test]
-    fn ios_limits_same_cookie_verification_but_retries_new_sessions_and_callbacks() {
+    fn limits_same_cookie_verification_but_retries_new_sessions_and_callbacks() {
         let mut verification = super::LoginVerification::default();
-        for _ in 0..4 { assert!(verification.should_verify_ios_cookie("SESSID=one; uid=12", None)); }
-        assert!(!verification.should_verify_ios_cookie("uid=12; SESSID=one", None));
-        assert!(verification.should_verify_ios_cookie("SESSID=two; uid=12", None));
-        for _ in 0..3 { assert!(verification.should_verify_ios_cookie("SESSID=two; uid=12", None)); }
-        assert!(!verification.should_verify_ios_cookie("SESSID=two; uid=12", None));
-        assert!(verification.should_verify_ios_cookie("SESSID=two; uid=12", Some("new-callback")));
+        for _ in 0..4 { assert!(verification.should_verify_cookie("SESSID=one; uid=12", None)); }
+        assert!(!verification.should_verify_cookie("uid=12; SESSID=one", None));
+        assert!(verification.should_verify_cookie("SESSID=two; uid=12", None));
+        for _ in 0..3 { assert!(verification.should_verify_cookie("SESSID=two; uid=12", None)); }
+        assert!(!verification.should_verify_cookie("SESSID=two; uid=12", None));
+        assert!(verification.should_verify_cookie("SESSID=two; uid=12", Some("new-callback")));
     }
 
     #[test]
-    fn ios_resumes_verification_after_cooldown_even_if_login_keeps_the_same_cookie() {
+    fn resumes_verification_after_cooldown_even_if_login_keeps_the_same_cookie() {
         let mut verification = super::LoginVerification::default();
-        for _ in 0..4 { assert!(verification.should_verify_ios_cookie("SESSID=unchanged", None)); }
-        assert!(!verification.should_verify_ios_cookie("SESSID=unchanged", None));
+        for _ in 0..4 { assert!(verification.should_verify_cookie("SESSID=unchanged", None)); }
+        assert!(!verification.should_verify_cookie("SESSID=unchanged", None));
         // 短信登录完成后 Cookie 可能不变，冷却结束必须重新校验，不能永久停掉自动同步。
-        verification.ios_cookie_next_retry = Some(std::time::Instant::now());
-        assert!(verification.should_verify_ios_cookie("SESSID=unchanged", None));
-        assert_eq!(verification.ios_cookie_attempts, 1);
+        verification.cookie_next_retry = Some(std::time::Instant::now());
+        assert!(verification.should_verify_cookie("SESSID=unchanged", None));
+        assert_eq!(verification.cookie_attempts, 1);
     }
 
     #[test]
@@ -4106,6 +4143,49 @@ mod login_callback_tests {
     }
 
     #[test]
+    fn records_callback_without_access_code_but_only_blocks_authorization_code() {
+        let session = super::LoginSession::default();
+        let origin = "http://127.0.0.1:17520";
+
+        // 只带 ck 的回调要记录，但放行，让窗口显示“正在验证”页面而不是停在原页。
+        let with_ck = reqwest::Url::parse("http://127.0.0.1:17520/#/auth_callback?ck=SESSID%3Dx").unwrap();
+        assert!(!super::capture_login_callback(&session, &with_ck, origin));
+        assert_eq!(session.callback_url.lock().unwrap().as_deref(), Some(with_ck.as_str()));
+
+        // 路径式回调同样要记录。
+        let path_style = reqwest::Url::parse("http://127.0.0.1:17520/auth_callback?ck=SESSID%3Dy").unwrap();
+        assert!(!super::capture_login_callback(&session, &path_style, origin));
+        assert_eq!(session.callback_url.lock().unwrap().as_deref(), Some(with_ck.as_str()));
+
+        // 带授权码的回调必须拦截，并覆盖之前的记录。
+        let with_code = reqwest::Url::parse("http://127.0.0.1:17520/#/auth_callback?ac=access_token&code=one").unwrap();
+        assert!(super::capture_login_callback(&session, &with_code, origin));
+        assert_eq!(session.callback_url.lock().unwrap().as_deref(), Some(with_code.as_str()));
+
+        // 空 hash（#）也要回退到路径判定。
+        let empty_hash = reqwest::Url::parse("http://127.0.0.1:17520/auth_callback#").unwrap();
+        assert_eq!(
+            super::login_callback_kind(&empty_hash, origin),
+            Some("app-origin")
+        );
+
+        let other_origin = reqwest::Url::parse("https://www.coolapk.com/").unwrap();
+        assert!(!super::capture_login_callback(&session, &other_origin, origin));
+    }
+
+    #[test]
+    fn baseline_session_is_not_auto_verified_until_cookie_changes() {
+        let mut verification = super::LoginVerification::default();
+        // 首次读取只用来记录基线，本身不触发登录。
+        assert!(!verification.remember_baseline("SESSID=old; uid=1"));
+        // Cookie 顺序变化仍属同一会话。
+        assert!(!verification.remember_baseline("uid=1; SESSID=old"));
+        // 用户真正重新登录后会话变化，允许自动同步。
+        assert!(verification.remember_baseline("SESSID=new; uid=1"));
+        assert!(verification.remember_baseline("SESSID=new2; uid=1"));
+    }
+
+    #[test]
     fn classifies_transient_login_callbacks() {
         let official = reqwest::Url::parse(
             "https://account.coolapk.com/auth/callback?ac=access_token&code=server-code",
@@ -4122,6 +4202,15 @@ mod login_callback_tests {
         .unwrap();
         assert_eq!(
             login_callback_kind(&app, "http://127.0.0.1:17520"),
+            Some("app-origin")
+        );
+
+        let path_route = reqwest::Url::parse(
+            "http://127.0.0.1:17520/auth_callback?ac=access_token&code=server-code",
+        )
+        .unwrap();
+        assert_eq!(
+            login_callback_kind(&path_route, "http://127.0.0.1:17520"),
             Some("app-origin")
         );
 
