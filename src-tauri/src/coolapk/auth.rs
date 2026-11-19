@@ -4,9 +4,7 @@ use md5::{Digest, Md5};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const APP_ID: &str = "com.coolapk.market";
-const APP_CODE: u64 = 2_604_201;
-const STD_BASE64_ALPHABET: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const APP_CODE: u64 = 2_611_121;
 const AUTH_BLOB_B64: &str = include_str!("auth_blob.b64");
 
 /// 酷安 Token V3 离线签名器。
@@ -80,12 +78,14 @@ impl CoolapkAuth {
             .encode(format!("{:x}/{}", timestamp, md5_hex(plain.as_bytes())))
             .trim_end_matches('=')
             .to_string();
-        let salt22 = shift_last_base64_char(
+        // 官方实现的盐 = 标准 base64 前 21 位 + 固定 '.'；末位不是 base64 字符，
+        // 但 bcrypt 只取它的高 2 位，实测与官方 token 逐字节一致。
+        let salt22 = format!(
+            "{}.",
             salt_source
-                .get(..22)
-                .ok_or_else(|| "generated salt is too short".to_string())?,
-            -5,
-        )?;
+                .get(..21)
+                .ok_or_else(|| "generated salt is too short".to_string())?
+        );
 
         let salt_bytes = BCRYPT_BASE64
             .decode(salt22.as_bytes())
@@ -111,18 +111,22 @@ fn md5_hex(bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn shift_last_base64_char(value: &str, shift: i32) -> Result<String, String> {
-    let (prefix, last) = value.split_at(value.len().saturating_sub(1));
-    let last = last
-        .as_bytes()
-        .first()
-        .ok_or_else(|| "cannot shift an empty salt".to_string())?;
-    let index = STD_BASE64_ALPHABET
-        .iter()
-        .position(|candidate| candidate == last)
-        .ok_or_else(|| "salt contains a non-base64 character".to_string())? as i32;
-    let shifted = (index + shift).rem_euclid(64) as usize;
-    Ok(format!("{prefix}{}", STD_BASE64_ALPHABET[shifted] as char))
+#[cfg(test)]
+mod probe_tests {
+    use super::CoolapkAuth;
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+
+    #[test]
+    fn probe_salt_for_known_real_timestamp() {
+        let device = "gNykjY3ITZjRzNlRTY0gzNgsTMwAjLyETOwQjMuE0MRFEI7MkMxITM4AjMyAyOp1GZlJFI7kWbvFWaYByOgsDI7AyOmdWQFZFOLRFZKVjSIBnU1AXQXJjN5YzTlBlSt0CM1gUd3UFR";
+        let auth = CoolapkAuth::new(device);
+        let token = auth.generate_token_at(1_795_096_595).unwrap();
+        let body = &token[2..];
+        let padded = format!("{body}{}", "=".repeat((4 - body.len() % 4) % 4));
+        let decoded = String::from_utf8(BASE64.decode(padded).unwrap()).unwrap();
+        println!("PROBE_SALT={decoded}");
+        println!("REAL_SALT=$2y$04$NmFmZWYwMTMvZGVmZTQwZ.Q/letpnjTvhRLkevU06/rbD/hFq4UEi");
+    }
 }
 
 #[cfg(test)]
