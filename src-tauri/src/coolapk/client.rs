@@ -1039,18 +1039,60 @@ pub(crate) fn base_http_client_builder() -> reqwest::ClientBuilder {
     builder
 }
 
+/// 酷安网关会用 UA 里的 `+CoolMarket/<版本>-<构建号>` 段做客户端版本校验：
+/// 缺段或版本过旧一律返回 403 空响应。这里把版本抬到当前支持的最低值并补齐该段。
+pub(crate) const SUPPORTED_APP_VERSION: &str = "16.7.3";
+pub(crate) const SUPPORTED_APP_CODE: &str = "2611121";
+
+fn version_parts(value: &str) -> (u64, u64, u64) {
+    let mut numbers = value.split(|c: char| !c.is_ascii_digit()).filter(|item| !item.is_empty());
+    let first = numbers.next().and_then(|item| item.parse().ok()).unwrap_or(0);
+    let second = numbers.next().and_then(|item| item.parse().ok()).unwrap_or(0);
+    let third = numbers.next().and_then(|item| item.parse().ok()).unwrap_or(0);
+    (first, second, third)
+}
+
+/// 低于支持版本的取值会被忽略，避免用户手动填了旧版本后整个客户端 403。
+pub(crate) fn normalize_app_version(value: Option<&str>) -> String {
+    match value.map(str::trim).filter(|item| !item.is_empty()) {
+        Some(item) if version_parts(item) >= version_parts(SUPPORTED_APP_VERSION) => item.to_string(),
+        _ => SUPPORTED_APP_VERSION.to_string(),
+    }
+}
+
+pub(crate) fn normalize_app_code(value: Option<&str>) -> String {
+    let minimum: u64 = SUPPORTED_APP_CODE.parse().unwrap_or(0);
+    match value.map(str::trim).filter(|item| !item.is_empty()) {
+        Some(item) if item.parse::<u64>().is_ok_and(|code| code >= minimum) => item.to_string(),
+        _ => SUPPORTED_APP_CODE.to_string(),
+    }
+}
+
+/// 把 UA 末尾的 `+CoolMarket/...` 段替换成当前版本；原 UA 没有该段时直接补上。
+pub(crate) fn with_coolmarket_suffix(user_agent: &str, version: &str, code: &str) -> String {
+    let base = user_agent.split(" +CoolMarket/").next().unwrap_or(user_agent).trim();
+    format!("{base} +CoolMarket/{version}-{code}-universal")
+}
+
 fn build_api_clients(profile: &DeviceProfile) -> Result<(Client, Client), String> {
+    let app_version = normalize_app_version(profile.app_version.as_deref());
+    let app_code = normalize_app_code(profile.app_code.as_deref());
+    let user_agent = with_coolmarket_suffix(
+        profile.user_agent.as_deref().unwrap_or(super::native_device::COMPATIBILITY_UA),
+        &app_version,
+        &app_code,
+    );
     let mut headers = HeaderMap::new();
-    headers.insert(USER_AGENT, profile.user_agent.as_deref().and_then(|value| HeaderValue::from_str(value).ok()).unwrap_or_else(|| HeaderValue::from_static(super::native_device::COMPATIBILITY_UA)));
+    headers.insert(USER_AGENT, HeaderValue::from_str(&user_agent).map_err(|_| "生成请求 UA 失败".to_string())?);
     headers.insert("X-Sdk-Int", profile.sdk_int.as_deref().and_then(|value| HeaderValue::from_str(value).ok()).unwrap_or_else(|| HeaderValue::from_static("36")));
     headers.insert("X-Sdk-Locale", HeaderValue::from_static("zh-CN"));
     headers.insert("X-App-Mode", HeaderValue::from_static("universal"));
     headers.insert("X-App-Channel", HeaderValue::from_static("coolapk"));
     headers.insert("X-App-Id", HeaderValue::from_static("com.coolapk.market"));
-    headers.insert("X-App-Version", HeaderValue::from_static("16.2.0"));
-    headers.insert("X-App-Code", HeaderValue::from_static("2604201"));
+    headers.insert("X-App-Version", HeaderValue::from_str(&app_version).map_err(|_| "生成版本号失败".to_string())?);
+    headers.insert("X-App-Code", HeaderValue::from_str(&app_code).map_err(|_| "生成构建号失败".to_string())?);
     headers.insert("X-Api-Version", HeaderValue::from_static("16"));
-    headers.insert("X-App-Supported", HeaderValue::from_static("2604201"));
+    headers.insert("X-App-Supported", HeaderValue::from_str(&app_code).map_err(|_| "生成支持版本失败".to_string())?);
     headers.insert("X-Dark-Mode", HeaderValue::from_static("0"));
     let client = http_client_builder().default_headers(headers.clone()).build().map_err(|_| "创建酷安 HTTP 客户端失败".to_string())?;
     let redirect_client = http_client_builder().default_headers(headers).redirect(reqwest::redirect::Policy::none()).build().map_err(|_| "创建酷安重定向客户端失败".to_string())?;
@@ -1293,6 +1335,18 @@ impl CoolapkClient {
             override_fields!(manufacturer, brand, model, build, device_id, ddid, user_agent,
                 sdk_int, locale, app_version, app_code, api_version, dark_mode);
         }
+        // 网关按 UA 与 X-App-Version/X-App-Code 判断客户端版本，旧值会直接 403。
+        profile.app_version = Some(normalize_app_version(profile.app_version.as_deref()));
+        profile.app_code = Some(normalize_app_code(profile.app_code.as_deref()));
+        let base_ua = profile
+            .user_agent
+            .clone()
+            .unwrap_or_else(|| super::native_device::COMPATIBILITY_UA.to_string());
+        profile.user_agent = Some(with_coolmarket_suffix(
+            &base_ua,
+            profile.app_version.as_deref().unwrap_or(SUPPORTED_APP_VERSION),
+            profile.app_code.as_deref().unwrap_or(SUPPORTED_APP_CODE),
+        ));
         profile
     }
 
@@ -7063,8 +7117,8 @@ impl CoolapkClient {
         // 覆盖默认 UA 和自定义 UA，避免从 #Build 或 Dalvik 片段重新识别机型。
         let mut headers = HeaderMap::new();
         headers.insert(USER_AGENT, HeaderValue::from_str(&format!("CoolMarket/{}-{}-universal",
-            profile.app_version.as_deref().unwrap_or("16.2.0"),
-            profile.app_code.as_deref().unwrap_or("2604201"))).map_err(|_| "发布 UA 格式无效")?);
+            profile.app_version.as_deref().unwrap_or(SUPPORTED_APP_VERSION),
+            profile.app_code.as_deref().unwrap_or(SUPPORTED_APP_CODE))).map_err(|_| "发布 UA 格式无效")?);
         Ok(request.headers(headers))
     }
 
@@ -9278,6 +9332,33 @@ mod api_failure_log_tests {
 #[cfg(test)]
 #[path = "client_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod client_version_header_tests {
+    use super::{normalize_app_code, normalize_app_version, with_coolmarket_suffix};
+
+    #[test]
+    fn user_agent_keeps_single_current_coolmarket_suffix() {
+        let plain = with_coolmarket_suffix("Dalvik/2.1.0 (Linux; U; Android 16; X Build/Y)", "16.7.3", "2611121");
+        assert!(plain.ends_with(" +CoolMarket/16.7.3-2611121-universal"));
+        let replaced = with_coolmarket_suffix(
+            "Dalvik/2.1.0 (Linux; U; Android 16) +CoolMarket/16.2.0-2604201-universal",
+            "16.7.3",
+            "2611121",
+        );
+        assert_eq!(replaced.matches("+CoolMarket/").count(), 1);
+        assert!(replaced.ends_with("+CoolMarket/16.7.3-2611121-universal"));
+    }
+
+    #[test]
+    fn outdated_app_version_and_code_fall_back_to_supported_ones() {
+        assert_eq!(normalize_app_version(Some("16.2.0")), "16.7.3");
+        assert_eq!(normalize_app_version(None), "16.7.3");
+        assert_eq!(normalize_app_version(Some("17.0.0")), "17.0.0");
+        assert_eq!(normalize_app_code(Some("2604201")), "2611121");
+        assert_eq!(normalize_app_code(Some("2611121")), "2611121");
+    }
+}
 
 #[cfg(test)]
 mod download_file_tests {
